@@ -1,2 +1,5 @@
 /data/
+/tf_weights/
 /.ipynb_checkpoints/
+/.vscode/
+/__pycache__/
