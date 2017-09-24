@@ -5,6 +5,7 @@ from matplotlib.ticker import FuncFormatter
 from collections import defaultdict
 
 from ..db_manager import product_info
+from ..factory import ohlc_chart
 
 class Market:
     """
@@ -16,19 +17,18 @@ class Market:
     short = Short = S = -1
     commission = 3.5 #편도 수수료
     
-    def __init__(self, feed, sig_gen=None):
+    def __init__(self, feed, signal=None):
         """
         feed: pandas dataframe 형식의 시장 기초데이터
-         1) 일별 date, open, high, low, close 가격정보
-
-        sig_gen: signal 생성 함수
+        signal: signal 생성 함수
         """
-        if not sig_gen:
-            sig_gen = self.default_sig_gen
-        self.pinfo = {}
-        self.preprocessing(feed, sig_gen)
+        if not signal:
+            signal = self.default_signal
         
-    def preprocessing(self, feed, sig_gen):
+        self.pinfo = {}
+        self.preprocessing(feed, signal)
+        
+    def preprocessing(self, feed, signal):
         """
         종목별로 시그널을 생성하여 feed에 merge하고
         종목별 데이터를 날짜순으로 모두 합침
@@ -38,35 +38,36 @@ class Market:
         container = []
         pinfo = product_info()
         for (cnt,inst) in enumerate(feed.values()):
-            if cnt == 10:
-                break
-            
             symbol =  inst.attrs['symbol']
             if symbol == 'None' or not symbol:
                 continue
+            
             else:
                 self.pinfo[symbol] = pinfo[symbol]
             
             datatable = pd.DataFrame(inst.value[:,1:], index=inst.value[:,0].astype('M8[s]'), columns=header[1:])
             datatable.sort_index(inplace=True)
             
-            if sig_gen:
+            if signal:
                 print(f"\r preprocessing data...({cnt})          ", end='', flush=True)
-                sig_gen(datatable)
+                signal(datatable)
             columns = datatable.columns.tolist()
             new_column = [[symbol for i in range(len(columns))], columns]
             datatable.columns = new_column
             container.append(datatable)
         print('\nDone')
-            
-        self.feed = pd.concat(container, axis=1).sort_index(axis=1)
+        # warm period = 60days
+        self.feed = pd.concat(container, axis=1).sort_index(axis=1).iloc[60:]
     
     @classmethod
-    def price_to_money(cls, value, pinfo):
-        return value * pinfo['tick_value'] / pinfo['tick_unit']
+    def price_to_value(cls, inst, price):
+        """
+        상품가격(차이)를 그에 해당하는 화폐단위로 변화
+        """
+        return price * inst['tick_value'] / inst['tick_unit']
     
     @classmethod
-    def get_profit(self, pinfo, position, entryprice, exitprice, lot=1):
+    def get_profit(self, inst, position, entryprice, exitprice, lot=1):
         """
         틱: (청산가격 - 진입가격)/틱단위
         손익계산: 랏수 * 틱가치 * 틱      
@@ -74,8 +75,8 @@ class Market:
         if np.isnan(entryprice) or np.isnan(exitprice):
             raise ValueError('Nan value can not be calculated')
         
-        tick = round(position * (exitprice - entryprice)/pinfo['tick_unit'])
-        profit = lot * pinfo['tick_value']* tick
+        tick = round(position * (exitprice - entryprice)/inst['tick_unit'])
+        profit = lot * inst['tick_value']* tick
         
         return profit, tick
     
@@ -85,14 +86,15 @@ class Market:
         진입 주문시 슬리피지 계산
         """
         bound = (price2 - price1)*skid
-        price = np.random.uniform(price1, price1 + bound)
-        price = round(price, pinfo['decimal_places'])
+        #price = np.random.uniform(price1, price1 + bound)
+        
+        price = round(price1+bound, pinfo['decimal_places'])
         
         return price
     
     
     @classmethod
-    def get_lot(cls, pinfo, risk, heat):
+    def get_lot(cls, risk, heat):
         lot = int(heat / risk)
         return lot
     
@@ -106,21 +108,94 @@ class Market:
             metrics['ATR'] = df['TR'].ewm(span).mean()
     
     @staticmethod
-    def default_sig_gen(datatable):
+    def default_signal(datatable):
         """
         시장 기초데이터로부터 MA, trend index등을 생성하는 
         data preprocessing method이다.
         
         datatable: 종목별 ohlc 데이터를 저장한 pandas dataframe
-        default 값으로 20일 이평과 60일 이평을 추가한다.
+        gc: 20일 지수이평과 60일 지수이평의 교차신호
+        atr: 20일 atr
         
         """
         Market.set_ATR(datatable, span=20)
         
-        datatable['ma20'] = datatable['close'].rolling(20).mean()
-        datatable['ma60'] = datatable['close'].rolling(20).mean()
+        ema20 = datatable['close'].ewm(20).mean()
+        ema60 = datatable['close'].ewm(60).mean()
+        
+        datatable['golden'] = (ema20>ema60).astype('int').diff().shift(1)
         datatable.dropna(inplace=True)
 
+class Trade:
+    
+    def __init__(self):
+        self.open_trades = [] #진행중인 매매
+        self._log = [] #종료된 매매기록
+        self.entryid = 0
+        
+    
+    
+        
+    def open(self, inst, strategy, position, entrydate,
+             entryprice, entrylot, stopprice, risk):
+        
+        self.entryid += 1
+        trade = {
+            'id': self.entryid,
+            'symbol': inst['group'],
+            'name': inst['name'],
+            'inst': inst,
+            'strat': strategy,
+            'position': position,
+            'entrydate': entrydate,
+            'entryprice': entryprice,
+            'entrylot': entrylot,
+            'stopprice': stopprice,
+            'openlot': entrylot,
+            'risk': risk
+        }
+        self.open_trades.append(trade)
+    
+    
+    def close(self, trade, exitdate, exitprice, force):
+        
+        trade['exitdate'] = exitdate
+        trade['exitprice'] = exitprice
+        trade['exitlot'] = trade['entrylot']
+        trade['force'] = force
+        
+        profit, tick = Market.get_profit(trade['inst'], trade['position'], trade['entryprice'],
+                                   trade['exitprice'], lot=trade['exitlot'])
+        
+        trade['profit'] = profit
+        trade['tick'] = tick
+        
+        self._log.append(trade)
+        self.open_trades.remove(trade)
+        return trade
+        
+    
+    def get(self, inst, strategy, position):
+        symbol = inst['group']
+        trade = list(filter(lambda x: x['symbol']==symbol\
+                     and x['position']==position\
+                     and x['strat']==strategy, self.open_trades))
+        if trade:
+            return trade[0]
+        else:
+            return None
+        
+    def isopen(self, inst, strategy, position):
+        symbol = inst['group']
+        trade = self.get(inst, strategy, position)
+        if trade:
+            return True
+        else:
+            return False
+    
+    def count(self):
+        return len(self.open_trades)
+    
 
 class Trader:
     """
@@ -130,22 +205,30 @@ class Trader:
     매매분석
     """
     def __init__(self, market, principal, portfolio_heat, heat, 
-                 strategy=None, stop_rule=None, max_lot=None):
+                 strategy=None, stop=None, max_lot=None):
         # 시장 정보 설정
-        self.feed = market.feed
-        self.pinfo = market.pinfo.copy()
+        #self.feed = market.feed.copy(deep=True)
+        self.market = market
+        self.pinfo = copy.deepcopy(market.pinfo)
+        self.trades = Trade()
         
         if strategy:
             Trader.strategy = strategy
         else:
             Trader.strategy = Trader.default_strategy
     
-        if stop_rule:
-            self.stop_rule = stop_rule
-        else:
-            self.stop_rule = self.default_stop_rule
+        Trader.stop = stop #스탑 규칙
 
-        #자산 초기값 설정
+        """
+        * 자산 초기값 설정 *
+        principal: 투자원금
+        capital: 순자산
+        equity: 순자산 + 평가손익 (평가자산)
+        real_equity: 순자산 + 청산예정손익 (실질자산)
+        avail_equity: equity - 증거금 (가용자산)
+        cum_commision: 누적 수수료
+        """
+        self.principal = principal
         self.capital = principal
         self.equity = principal
         self.avail_equity = principal
@@ -153,75 +236,87 @@ class Trader:
         self.cum_commission = 0 #누적 수수료
         self.maxlot = max_lot
         
-        #매매규칙 초기값 설정
+        """
+        * 리스크 *
+        portfolio_heat: real_equity 대비 허용가능 포트폴리오 손실액
+        heat: real_equity 대비 허용가능 매매 손실액
+        """
         self._portfolio_heat = portfolio_heat
         self._heat = heat
         
         #매매관련 정보
-        self.entryid = 0
-        self._tradelog = [] #매매 기록
         self._equitylog = [] #자산 기록
         self._rejected_order = [] #진입 거부된 매매
-        self.open_entries = { 
-            symbol: {Market.long:{}, Market.short:{} } for symbol in self.pinfo.keys()
-        }
-    
-    @property
-    def tradelog(self):
-        columns = ['id','inst','pos','entry date','entry price','entry lot',
-                   'exit date','exit price','exit lot','force exit','profit','tick']
-        return pd.DataFrame(self._tradelog, columns = columns)
     
     @property
     def equitylog(self):
         columns = ['date', 'capital','open profit','equity','real equity',
-                   'port risk', 'cum commission']
+                   'port risk', 'port heat', 'fee', '#']
         return pd.DataFrame(self._equitylog, columns=columns).set_index('date')
     
     @property
+    def tradelog(self):
+        df = pd.DataFrame(self.trades._log)
+        df = df[['id','symbol','name','position','entrydate','entryprice','stopprice','entrylot',
+                 'exitdate','exitprice','exitlot','force','risk','profit','tick','strat']].copy(deep=True)
+        df['position'] = np.where(df['position']==Market.long, 'Long','Short')
+        return df
+    
+    @property
     def rejected_order(self):
-        columns = ['num trades','name','date','real equity', 'risk','risk capa',
-                   'port risk', 'port risk capa','strategy','type']
+        columns = ['num trades','name','date','real equity', 'risk','heat',
+                   'port risk', 'port heat','strategy','type']
         return pd.DataFrame(self._rejected_order, columns=columns)
     
     @property
     def heat(self):
+        """
+        실질자산 대비 허용가능 매매 손실액
+        """
         return self._heat * self.real_equity
     
     @property
     def portfolio_heat(self):
-        return self._portfolio_heat * self.real_equity
+        """
+        실질자산 대비 허용가능 포트 손실액
+        """
+        return self._portfolio_heat * self.capital
     
     @property
     def portfolio_risk(self):
-        portfolio_risk = 0
-        for inst in self.open_entries.values():
-            for position in inst.values():
-                for strat in position.values():
-                    portfolio_risk += strat['risk']
-                
-        return portfolio_risk
-    
-    def get_risk(self, info, position, entryprice, stopprice, lot=1):
         """
-        리스크 계산기
+        포트폴리오 리스크: 
+        """
+        risk = self.capital - self.real_equity
+        return risk if risk > 0 else 0
+        #return sum(trade['risk'] for trade in self.trades.open_trades)
+        
+    def get_risk(self, inst, position, entryprice, stopprice, lot=1):
+        """
         리스크 = (진입가 - 스탑가격) * 가격유닛 * 랏수
         """
         pricediff = position * (entryprice - stopprice)
-        risk_per_lot = Market.price_to_money(pricediff, info) if pricediff > 0 else 0
-        return risk_per_lot * lot
+        if pricediff < 0:
+            raise ValueError("trade risk cannot be negative")
+        else:
+            risk_per_lot = Market.price_to_value(inst, pricediff)
+            return risk_per_lot * lot
     
-    def run_trade(self):
-        symbols = self.feed.columns.levels[0] #종목 코드
+    def run_trade(self, start=None, end=None):
+        #symbols = self.feed.columns.remove_un levels[0] #종목 코드
+        self.feed = self.market.feed.loc[start:end].copy(deep=True)
+        self.feed.columns = self.feed.columns.remove_unused_levels()
+        symbols = self.feed.columns.levels[0]
+        
         for date, metrics in self.feed.iterrows():
             print("\r now trading at %s         "%date, end='', flush=True)
             self.commission = 0
             
             for symbol in symbols:
                 metric = metrics[symbol]
-                info = self.pinfo[symbol]
+                inst = self.pinfo[symbol]
                 if not metric.hasnans:
-                    self.strategy(info, metric)
+                    self.strategy(inst, metric)
                 
             # 강제청산 모니터링 및 매매기록
             self.force_stop(metrics)
@@ -230,206 +325,326 @@ class Trader:
                 print("\nYou went bankrupt!")
                 break
                 
-    def buy(self, info, position, date, entryprice, stopprice, strat='strat_0', ref=None):
+    
+    def buy(self, inst, strat, position, entrydate, entryprice, stopprice):
         
-        risk = self.get_risk(info, position, entryprice, stopprice, lot=1)
-        port_risk = self.portfolio_risk
+        # 기준값
         heat = self.heat
         port_heat = self.portfolio_heat
-        num_trades = self.count_trades()
+        port_risk = self.portfolio_risk
+        num_trades = self.trades.count()
+
+        # 랏당 리스크 계산
+        risk_per_lot = self.get_risk(inst, position, entryprice, stopprice, lot=1)
         
         
-        if risk > heat:
-            self._rejected_order.append([num_trades, info['name'], date, self.real_equity, risk, heat,
-                                         port_risk, port_heat, strat, 1])
-        
-        elif port_risk + risk > port_heat:
-            self._rejected_order.append([num_trades, info['name'], date, self.real_equity, risk, heat,
-                                         port_risk, port_heat, strat, 2])
-        
+        #랏당 리스크가 기준치 초과하면 매매거부
+        if risk_per_lot > heat:
+            self._rejected_order.append( [num_trades, inst['name'], entrydate, self.real_equity, risk_per_lot, heat,
+                                 port_risk, port_heat, strat, 1])
+        elif risk_per_lot > port_heat - port_risk:
+            self._rejected_order.append( [num_trades, inst['name'], entrydate, self.real_equity, risk_per_lot, heat,
+                                 port_risk, port_heat, strat, 2])
+            
         else:
-            self.entryid += 1
-            symbol = info['group']
-            entrylot = Market.get_lot(info, risk, heat)
+            #리스크에 맞게 랏 계산
+            actual_heat = min(heat, port_heat - port_risk)
+            entrylot = Market.get_lot(risk_per_lot, actual_heat)
+            risk = self.get_risk(inst, position, entryprice, stopprice, lot=entrylot)
             
             #최대허용가능 랏수
             if self.maxlot and entrylot > self.maxlot:
                 entrylot = self.maxlot
-            
+        
+        
             #진입하려는 전략이 이미 매매중인 경우 에러
-            if strat in self.open_entries[symbol][position]:
-                raise AttributeError(f"open entry for '{symbol}' on '{position}' already exist!")
+            if self.trades.isopen(inst, position, strat):
+                raise AttributeError(f"open entry for '{inst['name']}' on '{position}' already exist!")
             
             #가격이 이상한 경우 에러
             if np.isnan(entryprice) or np.isnan(stopprice):
-                raise ValueError(f"Price {price} can not be NaN value")
+                raise ValueError(f"Price can not be NaN value")
                     
             else:
-                self.open_entries[symbol][position][strat] = {
-                    'entryid': self.entryid,
-                    'strategy': strat,
-                    'instrument': info,
-                    'position': position,
-                    'entrydate': date,
-                    'entryprice': entryprice,
-                    'entrylot': entrylot,
-                    'openlot': entrylot,
-                    'stopprice': stopprice,
-                    'risk': risk,
-                    'ref': ref
-                }
+                self.trades.open(
+                    inst=inst,
+                    strategy=strat,
+                    position=position,
+                    entrydate=entrydate,
+                    entryprice=entryprice,
+                    entrylot=entrylot,
+                    stopprice=stopprice,
+                    risk=risk
+                )
                 self.commission += (entrylot * Market.commission)
             
 
-    def sell(self, info, position, date, price, strat='strat_0', force=False):
-        symbol = info['group']
-        if strat not in self.open_entries[symbol][position]:
-            return
-        
-        else:
-            open_entry = self.open_entries[symbol][position][strat]
-        
-        entryid = open_entry['entryid']
-        inst = info['name']
-        entrydate = open_entry['entrydate']
-        entryprice = open_entry['entryprice']
-        entrylot = open_entry['entrylot']
-        openlot = open_entry['openlot']
+    def sell(self, trade, exitdate, exitprice, force=False):
+
+        #trade = self.trades.get(inst, strat, position)
+        #if trade['position']*(exitprice - trade['stopprice']) < 0:
+        #    exitprice = trade['stopprice']
             
-        exitdate = date
-        exitprice = price
-        exitlot = entrylot
             
-        profit, tick =  Market.get_profit(info, position, entryprice, exitprice, lot=exitlot)
+        log = self.trades.close(trade, exitdate, exitprice, force)
+        self.commission += (log['exitlot'] * Market.commission)
+        self.capital += log['profit']
         
-        openlot = openlot - exitlot
-        if openlot < 0:
-            raise ValueError("exit lot cannot be greater than open lot")
+    def force_stop(self, metrics):
+        """
+        강제청산: 일중가격이 스탑가격을 초과하면 스탑가격에서 청산
+        """
+        date = metrics.name
+        
+        for trade in self.trades.open_trades.copy():
+            symbol = trade['symbol']
+            
+            if not metrics[symbol].hasnans:
+                position = trade['position']
+                stopprice = trade['stopprice']
+                high = metrics[symbol]['high']
+                low = metrics[symbol]['low']
                 
-        elif openlot == 0:
-            del self.open_entries[symbol][position][strat]
-            
-        else:
-            open_entry['openlot'] = openlot
-                
-        pos = 'Long' if position == Market.long else 'Short'
-        self._tradelog.append([entryid, inst, pos, entrydate, entryprice, entrylot,
-                               exitdate, exitprice, exitlot,force, profit, tick])
-        
-        self.commission += (exitlot * Market.commission)
-        self.capital += profit
-        
+                if (position == Market.long) and (stopprice > low):
+                    trade['low'] = low
+                    self.sell(trade, date, trade['stopprice'], force=True)
+                    
+                elif (position == Market.short) and (stopprice < high):
+                    trade['high'] = high
+                    self.sell(trade, date, trade['stopprice'], force=True)
+                    
+                    
     def write_equitylog(self, metrics):
         
         date = metrics.name
-        open_profit, open_margin = self.update_status(metrics)
-        portfolio_risk = self.portfolio_risk
+        open_profit, stop_profit, margin = self.update_status(metrics)
         
         self.cum_commission += self.commission
         self.capital = self.capital - self.commission
         self.equity = self.capital + open_profit
-        self.avail_equity = self.equity - open_margin
-        self.real_equity = self.equity - portfolio_risk
-        self._equitylog.append([date, self.capital, open_profit, self.equity,
-                                self.real_equity, portfolio_risk,  self.cum_commission])
+        self.real_equity = self.capital + stop_profit
+        self.avail_equity = self.equity - margin
+        
+        self._equitylog.append([date, self.capital, open_profit, self.equity, self.real_equity,
+                                self.portfolio_risk, self.portfolio_heat, self.cum_commission, self.trades.count()])
         
     def update_status(self, metrics):
         """
-        1. stop price 업데이트
-        2. 자산 업데이트
+        1. 스탑가격 업데이트
+        2. 평가손익, 청산예정손익(stop profit), 증거금 업데이트
         """
-        
         open_profit = 0
-        open_margin = 0
+        stop_profit = 0
+        margin = 0
         
-        for inst in self.open_entries.values():
-            for position, strats in inst.items():
-                for strat in strats.values():
-                    info = strat['instrument']
-                    symbol = info['group']
-                    metric = metrics[symbol]
-                
-                    if not metric.hasnan:
-                        profit, tick = Market.get_profit(info, position, strat['entryprice'],
-                                                         metric['close'], lot=strat['openlot'])
-                        strat['open_profit'] = profit
-                    
-                    open_profit += strat['open_profit']
-                    open_margin += strat['openlot'] * info['keep_margin']
-                
-                    if np.isnan(open_profit):
-                        raise ValueError("Open profit can not be NaN value")
-                    
-                    #risk update
-                    strat['risk'] = self.get_risk(info, position, strat['entryprice'], strat['stopprice'], lot=strat['openlot'])
-                    
-        return open_profit, open_margin
-        
-    def force_stop(self, metrics):
-        date = metrics.name
-        
-        for inst in self.open_entries.values():
-            for position, strats in inst.items():
-                for stratname in list(strats):
-                    strat = inst[position][stratname]
-                    info = strat['instrument']
-                    symbol = info['group']
-                    high = metrics[symbol]['high']
-                    low = metrics[symbol]['low']
-                
-                    if np.isnan(high) or np.isnan(low):
-                        continue
-                        
-                    else:
-                        stopprice = strat['stopprice']
-                    
-                        if position == Market.long:
-                            pricediff = low - stopprice
-                    
-                        elif position == Market.short:
-                            pricediff = stopprice - high
+        for trade in self.trades.open_trades:
+            inst = trade['inst']
+            symbol = trade['symbol']
+            metric = metrics[symbol]
 
-                        #강제청산
-                        if pricediff < 0: 
-                            self.sell(info, position, date, stopprice, strat=stratname, force=True)
-                            
-                        #stop 가격 업데이트
-                        else:
-                            strat['stopprice'] = self.stop_rule(info, position, metrics[symbol], ref=strat['ref'])
+            if not metric.hasnans:
+                #stopprice update
+                if self.stop:
+                    trade['stopprice'] = self.stop(trade, metric)
+                
+                trade['open_profit'], _ = Market.get_profit(inst, trade['position'], trade['entryprice'],
+                                                 metric['close'], lot=trade['openlot'])
+                trade['stop_profit'], _ = Market.get_profit(inst, trade['position'], trade['entryprice'],
+                                                 trade['stopprice'], lot=trade['openlot'])
+                
+                                                
+            open_profit += trade['open_profit']
+            stop_profit += trade['stop_profit']
+            margin += trade['openlot'] * inst['keep_margin']
+            
+            if np.isnan(open_profit) or np.isnan(stop_profit):
+                        raise ValueError("Profit can not be NaN value")
+                    
+        return open_profit, stop_profit, margin
+        
+        
+
+        
+    """
+    결과 분석
+    """
+    def summary(self, level=0):
+        if level == 0:
+            self.equity_plot()
+            return self.total_result()
+        
+        elif level == 1:
+            return self.trade_result()
     
-    def count_trades(self):
-        cnt = 0
-        for inst in self.open_entries.values():
-            for pos in inst.values():
-                for strat in pos.values():
-                    cnt += 1
-        return cnt
+    def report(self, symbol, start=None, end=None):
+        """
+        종목별 매매 결과를 출력함
+        """
     
-    def default_strategy(self, info, metric):
+        feed = self.feed[symbol].loc[start:end].dropna()
+        tradelog = self.tradelog[self.tradelog.symbol == symbol]
+        if start and end:
+            trade = tradelog[ (start <= tradelog.entrydate) & (tradelog.exitdate <= end)]
+        else:
+            trade = tradelog
+        
+        cumprofit = trade.profit.cumsum()
+        num_trades = len(trade)
+        
+        fig, (ax) = plt.subplots(2,1, figsize=(15,10),
+                                gridspec_kw = {'height_ratios':[3,1]})
+        
+        #price chart
+        ax[0] = ohlc_chart(ax[0], feed, linewidth=0.8, color='black')
+        for idx, row in trade.iterrows():
+            y=feed.loc[row['entrydate']:row['exitdate']]
+            ax[0] = ohlc_chart(ax[0], y, color='red' if row['position']=='Long' else 'blue')
+       
+        #tick profit chart
+        ax[1].bar(np.arange(1,num_trades+1), np.where(trade.position=='Long', trade.tick, 0), 0.3, color='red', alpha=0.6 )
+        ax[1].bar(np.arange(1,num_trades+1), np.where(trade.position=='Short', trade.tick, 0), 0.3, color='blue', alpha=0.6 )
+           
+        #labels
+        name = self.pinfo[symbol]['name']
+        ax[0].set_title(name, fontsize=20)
+        ax[0].set_ylabel('Price', fontsize=15)
+        ax[1].set_ylabel('Profit (tick)', fontsize=15)
+       
+        #styles
+        ax[1].axhline(y=0, linewidth=1, color='darkgrey')
+        ax[1].yaxis.tick_right()
+        ax[1].set_facecolor('lightgoldenrodyellow')
+        ax[1].set_xticks(range(1,num_trades+1))
+        ax[1].grid(linestyle='--')
+    
+        plt.show()
+        return trade
+    
+    def trade_result(self):
+        result = []
+        for symbol, table in self.tradelog.groupby('symbol'):
+            #rng = (trader.feed.index.max() - trader.feed.index.min()).days/365.25
+            trade = OrderedDict({
+                'symbol': symbol,
+                'name': self.pinfo[symbol]['name'],
+                '총손익(틱)': table.tick.sum(),
+                '평균손익(틱)': table.tick.mean(),
+                '표준편차(틱)': table.tick.std(),
+                '위험대비손익': (table.profit/table.risk).mean(),
+                '매매횟수': len(table)
+            })
+            result.append(trade)
+        df = pd.DataFrame(result)
+        df.set_index('name', inplace=True)
+        del df.index.name
+        #styling
+        df = df.style.format({
+                    '평균손익(틱)': "{:.2f}",
+                    '표준편차(틱)': "{:.2f}",
+                    '위험대비손익': "{:.2%}",
+                })
+        return df
+    
+    def total_result(self):
+        trade = self.tradelog
+        equitylog = self.equitylog.loc[self.equitylog.index <= trade['exitdate'].max()]
+        realequity = equitylog['real equity']
+        capital = equitylog.capital.iloc[-1]
+
+        timedelta = (equitylog.index.max() - equitylog.index.min()).days/365.25
+        drawdown = (realequity.cummax() - realequity)/realequity.cummax()
+
+        mdd = drawdown.max()
+        icagr = np.log(capital/self.principal) /timedelta
+        bliss = icagr/mdd
+        cum_profit = (capital / self.principal) -1 
+        win_rate = trade.profit[trade.profit >= 0].count()\
+                                / trade.profit.count()
+        max_profit = trade.profit.max()
+        max_loss = trade.profit.min()
+        profit_factor = abs(trade.profit[trade.profit >=0].sum()/\
+                               trade.profit[trade.profit < 0].sum())
+        num_trade = trade.id.max() / timedelta
+        data = [[self.principal, capital, cum_profit, bliss, icagr, mdd, 
+                         profit_factor, win_rate, max_profit, max_loss, num_trade]]
+        columns = ['투자금','최종자산','총손익','Bliss','ICAGR','MDD','손익비','승률',
+                           '최대수익','최대손실','매매횟수(연)']
+        report = pd.DataFrame(data, index=['Total'], columns=columns)
+        report = report.style.format({
+                    '투자금': "{:,.1f}",
+                    '최종자산': "{:,.1f}",
+                    '총손익': "{:.2%}",
+                    'Bliss': "{:.4f}",
+                    'ICAGR': "{:.2%}",
+                    'MDD': "{:.2%}",
+                    '손익비': "{:.2f}",
+                    '승률': "{:.2%}",
+                    '최대수익': "{:,.2f}",
+                    '최대손실': "{:,.2f}",
+                    '매매횟수(연)': "{:.2f}"
+                })
+        
+        return report 
+    
+    def equity_plot(self):
+        trade = self.tradelog
+        equitylog = self.equitylog.loc[self.equitylog.index <= trade['exitdate'].max()]
+        x = equitylog.index.values
+        equity = equitylog.equity.values
+        realequity = equitylog['real equity'].values
+        realequity_max = equitylog['real equity'].cummax().values
+        
+        fig, ax = plt.subplots(1,1, figsize=(10, 8))
+        #ax.fill_between(x, realequity, facecolor='green',alpha=0.4, interpolate=True)
+        ax.fill_between(x, self.principal, realequity, where=realequity>=self.principal, facecolor='green', alpha=0.4, interpolate=True)
+        ax.fill_between(x, self.principal, realequity, where=realequity<self.principal, facecolor='red', alpha=0.6, interpolate=True)
+        ax.fill_between(x, realequity, realequity_max, color='grey', alpha=0.2)
+        ax.plot(x, equity)
+        ax.set_ylim(realequity.min()*0.99, equity.max()*1.01)
+        
+        #labels
+        ax.set_title('Cumulative Profit', fontsize=20)
+        ax.set_xlabel('Date', fontsize=15)
+        ax.set_ylabel('Profit', fontsize=15)
+        ax.yaxis.set_label_position("right")
+        
+        #style
+        ax.grid(linestyle='--')
+        ax.yaxis.set_major_formatter(FuncFormatter(lambda x, p: format(int(x), ',')))
+        ax.yaxis.tick_right()
+        fig.autofmt_xdate()
+        
+        plt.show()    
+    
+    def default_strategy(self, inst, metric):
         """
         ** default strategy: long only MA cross system **
         진입: 20종가이평이 60종가이평 돌파상승 한 다음날 시가 진입
         청산: 진입한 투자금(증거금) 대비 10% 이상 평가손실시 청산
         """
-        # 신호 확인
-        if metric['signal'] == 1:
-            #stop_price = Market.convert(metric['ATR'] * 5, info, origin='price', to='money')
-            entryprice= Market.get_price(info, metric['open'], metric['high'], skid=0.5)
-            info['refprice'] = entryprice
-            position = Market.long
-            stopprice = self.stop_rule(info, position, metric)
-            
-            self.buy(info, position, date, entryprice, stopprice, strat='TF')
-        if metric['signal'] == -1:
-            exitprice = Market.get_price(info, metric['open'], metric['low'], skid=0.5)
-            self.sell(info, metric.date, exitprice, strat='TF')
-            
-    @staticmethod        
-    def default_stop_rule(info, position, metric, ref=None):
-        if position == Market.long:
-            #stopprice = metric['close'] - diff*3
-            stopprice = ref - metric['ATR']*2
-        elif position == Market.short:
-            #stopprice = metric['close'] + diff*3
-            stopprice = ref + metric['ATR']*2
-        return stopprice
+        date = metric.name
+        # 상승 신호
+        if metric['golden'] == 1:
+            # 매수진입 매매 없으면 진입
+            if not self.trades.isopen(inst, 'GC', Market.long):
+                entryprice= Market.get_price(inst, metric['open'], metric['high'], skid=0.25)
+                stopprice = entryprice - metric['ATR']*3
+                self.buy(inst,'GC', Market.long, date, entryprice, stopprice)
+            # 매도진입 매매 있으면 청산
+            if self.trades.isopen(inst, 'GC', Market.short):
+                trade = self.trades.get(inst, 'GC', Market.short)
+                exitprice = Market.get_price(inst, metric['open'], metric['low'], skid=0.25)
+                self.sell(trade, date, exitprice)
+        
+        if metric['golden'] == -1:
+            #매도 진입 매매 없으면 매도 진입
+            if not self.trades.isopen(inst, 'GC', Market.short):
+                entryprice= Market.get_price(inst, metric['open'], metric['low'], skid=0.25)
+                stopprice = entryprice + metric['ATR']*3
+                self.buy(inst,'GC', Market.short, date, entryprice, stopprice)
+        
+            # 매수진입 매매 있으면 청산
+            if self.trades.isopen(inst, 'GC', Market.long):
+                trade = self.trades.get(inst, 'GC', Market.long)
+                exitprice = Market.get_price(inst, metric['open'], metric['high'], skid=0.25)
+                self.sell(trade, date, exitprice)

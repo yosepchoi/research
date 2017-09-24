@@ -87,7 +87,23 @@ def norm(data, ntype='abs_diff'):
 """
 캔들 차트
 """
-def ohlc_chart(ax, quotes, width=0.2, colorup='r', colordown='k',linewidth=0.5):
+def ohlc_chart(ax, quotes, linewidth=1, color='k'):
+    dates = quotes.index.values
+    ohlc = quotes[['open','high','low','close']].values
+    o,h,l,c = np.squeeze(np.split(ohlc, 4, axis=1))
+    offset = np.timedelta64(8, 'h')
+
+    ax.vlines(dates, l, h, linewidth=linewidth, color=color)
+    ax.hlines(o, dates-offset, dates, linewidth=linewidth, color=color)
+    ax.hlines(c, dates, dates+offset, linewidth=linewidth, color=color)
+
+    #style
+    ax.grid(linestyle='--')
+    ax.set_facecolor('lightgoldenrodyellow')
+    ax.yaxis.tick_right()
+    return ax
+
+def ohlc_chart2(ax, quotes, width=0.2, colorup='r', colordown='k',linewidth=0.5):
     OFFSET = width / 2.0
     lines = []
     openlines = []
