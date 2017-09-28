@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-from ..factory import ohlc_chart, norm
+from .factory import ohlc_chart, norm
 from .file_handler import open_file
 
 def gathering_trend(filepath, raw_file, window):

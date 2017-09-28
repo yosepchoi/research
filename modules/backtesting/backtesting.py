@@ -6,7 +6,7 @@ from matplotlib.ticker import FuncFormatter
 from collections import OrderedDict, defaultdict
 import time
 
-from ..db_manager import product_info
+from ..tools import product_info
 
 LONG = 1
 SHORT = -1

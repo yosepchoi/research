@@ -4,8 +4,7 @@ import matplotlib.pyplot as plt
 from matplotlib.ticker import FuncFormatter
 from collections import defaultdict
 
-from ..db_manager import product_info
-from ..factory import ohlc_chart
+from ..tools import product_info, ohlc_chart
 
 class Market:
     """

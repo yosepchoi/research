@@ -1,7 +1,5 @@
 import os
-import sqlite3 as lite
 import h5py
-import pandas as pd
 import tables as tb
 
 
@@ -26,13 +24,22 @@ def open_file(module, fname, mode='r', comp=False, force=False):
             else:
                 return tb.open_file(fpath, mode=mode)
 
+
 def product_info():
-    """
-    DB에서 종목정보 불러와 Dict type으로 리턴
-    """
-    fpath = os.path.join(DATADIR, 'db.sqlite3')
-    con = lite.connect(fpath)
-    products = pd.read_sql('select * from trading_product', con)
-    products.set_index(['group'], drop=False, inplace=True)
-    products = products.to_dict(orient='index')
-    return products
+    import json
+
+    fpath = os.path.join(DATADIR, 'product_info.json')
+    fobj = open(fpath).read()
+    return json.loads(fobj)
+
+
+#def product_info():
+#    """
+#    DB에서 종목정보 불러와 Dict type으로 리턴
+#    """
+#    fpath = os.path.join(DATADIR, 'db.sqlite3')
+#    con = lite.connect(fpath)
+#    products = pd.read_sql('select * from trading_product', con)
+#    products.set_index(['group'], drop=False, inplace=True)
+#    products = products.to_dict(orient='index')
+#    return products
