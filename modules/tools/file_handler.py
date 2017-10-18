@@ -1,6 +1,7 @@
 import os
 import h5py
 import tables as tb
+import pandas as pd
 
 
 from ..config import DATADIR
@@ -32,6 +33,19 @@ def product_info():
     fobj = open(fpath).read()
     return json.loads(fobj)
 
+
+def dataframe(symbol, file):
+    """
+    hdf5에 저장된 numpy array를 pandas dataframe 형식으로 변환하여 리턴
+    file.attrs['columns'] 에는 array의 각 column name을 포함하고 있어야함
+    각 file[symbol]['name']에는 각 데이터 name을 가지고 있어야함
+    """
+    columns = file.attrs['columns'].split(';')
+    df = pd.DataFrame(file[symbol].value, columns=columns)
+    df['date'] = df['date'].astype('M8[s]')
+    df.set_index('date', inplace=True)
+    df.name = file[symbol].attrs['name']
+    return df
 
 #def product_info():
 #    """

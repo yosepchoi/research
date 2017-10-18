@@ -37,3 +37,15 @@ class Daily(tb.IsDescription):
     close = tb.Float64Col(pos=4)
     volume = tb.UInt64Col(pos=5)
     
+class Density(tb.IsDescription):
+    """
+    trade density
+    Table structure:
+        - date: 날짜
+        - price: 가격
+        - value: 거래량
+    """
+
+    date = tb.Time32Col(pos=0)
+    price = tb.Float64Col(pos=1)
+    value = tb.Float64Col(pos=2)

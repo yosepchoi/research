@@ -1,8 +1,9 @@
+import copy
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.ticker import FuncFormatter
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 
 from ..tools import product_info, ohlc_chart
 
@@ -15,6 +16,7 @@ class Market:
     long = Long = L = 1
     short = Short = S = -1
     commission = 3.5 #편도 수수료
+    sectors = ['Currency','Grain','Meat','Tropical','Petroleum','Equity','Rate']
     
     def __init__(self, feed, signal=None):
         """
@@ -25,9 +27,9 @@ class Market:
             signal = self.default_signal
         
         self.pinfo = {}
-        self.preprocessing(feed, signal)
+        self._preprocessing(feed, signal)
         
-    def preprocessing(self, feed, signal):
+    def _preprocessing(self, feed, signal):
         """
         종목별로 시그널을 생성하여 feed에 merge하고
         종목별 데이터를 날짜순으로 모두 합침
@@ -125,14 +127,13 @@ class Market:
         datatable['golden'] = (ema20>ema60).astype('int').diff().shift(1)
         datatable.dropna(inplace=True)
 
+
 class Trade:
     
     def __init__(self):
         self.open_trades = [] #진행중인 매매
         self._log = [] #종료된 매매기록
         self.entryid = 0
-        
-    
     
         
     def open(self, inst, strategy, position, entrydate,
@@ -141,8 +142,9 @@ class Trade:
         self.entryid += 1
         trade = {
             'id': self.entryid,
-            'symbol': inst['group'],
+            'symbol': inst['symbol'],
             'name': inst['name'],
+            'sector': inst['sector'],
             'inst': inst,
             'strat': strategy,
             'position': position,
@@ -175,7 +177,7 @@ class Trade:
         
     
     def get(self, inst, strategy, position):
-        symbol = inst['group']
+        symbol = inst['symbol']
         trade = list(filter(lambda x: x['symbol']==symbol\
                      and x['position']==position\
                      and x['strat']==strategy, self.open_trades))
@@ -184,8 +186,12 @@ class Trade:
         else:
             return None
         
+    def get_sector(self, sector):
+        trades = list(filter(lambda x: x['inst']['sector'] == sector, self.open_trades))
+        return trades
+        
     def isopen(self, inst, strategy, position):
-        symbol = inst['group']
+        symbol = inst['symbol']
         trade = self.get(inst, strategy, position)
         if trade:
             return True
@@ -194,7 +200,7 @@ class Trade:
     
     def count(self):
         return len(self.open_trades)
-    
+
 
 class Trader:
     """
@@ -203,7 +209,7 @@ class Trader:
     매매기록
     매매분석
     """
-    def __init__(self, market, principal, portfolio_heat, heat, 
+    def __init__(self, market, principal, portfolio_heat, sector_heat, heat, 
                  strategy=None, stop=None, max_lot=None):
         # 시장 정보 설정
         #self.feed = market.feed.copy(deep=True)
@@ -216,8 +222,11 @@ class Trader:
         else:
             Trader.strategy = Trader.default_strategy
     
-        Trader.stop = stop #스탑 규칙
-
+        if stop:
+            Trader.stop = stop
+        else:
+            Trader.stop = Trader.default_stop
+        
         """
         * 자산 초기값 설정 *
         principal: 투자원금
@@ -242,6 +251,7 @@ class Trader:
         """
         self._portfolio_heat = portfolio_heat
         self._heat = heat
+        self._sector_heat = sector_heat
         
         #매매관련 정보
         self._equitylog = [] #자산 기록
@@ -256,28 +266,59 @@ class Trader:
     @property
     def tradelog(self):
         df = pd.DataFrame(self.trades._log)
-        df = df[['id','symbol','name','position','entrydate','entryprice','stopprice','entrylot',
+        df = df[['id','sector','symbol','name','position','entrydate','entryprice','stopprice','entrylot',
                  'exitdate','exitprice','exitlot','force','risk','profit','tick','strat']].copy(deep=True)
         df['position'] = np.where(df['position']==Market.long, 'Long','Short')
+        
         return df
     
     @property
-    def rejected_order(self):
-        columns = ['num trades','name','date','real equity', 'risk','heat',
-                   'port risk', 'port heat','strategy','type']
+    def rejected(self):
+        columns = ['#','name','date','real equity', 'risk','heat',
+                   'sector risk', 'sector heat','port risk', 'port heat','strategy','type']
+        
         return pd.DataFrame(self._rejected_order, columns=columns)
+    
+    def view(self, logname, df):
+        if logname == 'tradelog':
+            return df.style.format({
+                    'entryprice': "{:,.6g}",
+                    'stopprice': "{:,.6g}",
+                    'exitprice': "{:.6g}",
+                    'risk': "{:.0f}",
+                    'profit': "{:.0f}",
+                })
+        
+        if logname == 'rejected':
+            return self.rejected.syle.format({
+                    'real equity': "{:,.1f}",
+                    'risk': "{:,.1f}",
+                    'heat': "{:.1f}",
+                    'sector risk': "{:.1f}",
+                    'sector heat': "{:.1f}",
+                    'port risk': "{:.1f}",
+                    'port heat': "{:.1f}",
+            })
+    
     
     @property
     def heat(self):
         """
         실질자산 대비 허용가능 매매 손실액
         """
-        return self._heat * self.real_equity
+        return self._heat * self.capital
+    
+    @property
+    def sector_heat(self):
+        """
+        섹터별 허용가능 손실액
+        """
+        return self._sector_heat * self.capital
     
     @property
     def portfolio_heat(self):
         """
-        실질자산 대비 허용가능 포트 손실액
+        투자자산 대비 허용가능 포트 손실액
         """
         return self._portfolio_heat * self.capital
     
@@ -289,6 +330,17 @@ class Trader:
         risk = self.capital - self.real_equity
         return risk if risk > 0 else 0
         #return sum(trade['risk'] for trade in self.trades.open_trades)
+        
+    def sector_risk(self, inst):
+        trades = self.trades.get_sector(inst['sector'])
+        risk = 0
+        for trade in trades:
+            if ('stop_profit' in trade) and trade['stop_profit']:
+                risk += trade['stop_profit']
+            else:
+                risk += trade['risk']
+        
+        return risk
         
     def get_risk(self, inst, position, entryprice, stopprice, lot=1):
         """
@@ -329,6 +381,8 @@ class Trader:
         
         # 기준값
         heat = self.heat
+        sector_heat = self.sector_heat
+        sector_risk = self.sector_risk(inst)
         port_heat = self.portfolio_heat
         port_risk = self.portfolio_risk
         num_trades = self.trades.count()
@@ -340,14 +394,23 @@ class Trader:
         #랏당 리스크가 기준치 초과하면 매매거부
         if risk_per_lot > heat:
             self._rejected_order.append( [num_trades, inst['name'], entrydate, self.real_equity, risk_per_lot, heat,
-                                 port_risk, port_heat, strat, 1])
+                                 sector_risk, sector_heat, port_risk, port_heat, strat, 1])
+        
+        
+        elif risk_per_lot > sector_heat - sector_risk:
+            self._rejected_order.append( [num_trades, inst['name'], entrydate, self.real_equity, risk_per_lot, heat,
+                                 sector_risk, sector_heat, port_risk, port_heat, strat, 2])
+        
+        
         elif risk_per_lot > port_heat - port_risk:
             self._rejected_order.append( [num_trades, inst['name'], entrydate, self.real_equity, risk_per_lot, heat,
-                                 port_risk, port_heat, strat, 2])
+                                 sector_risk, sector_heat, port_risk, port_heat, strat, 3])
             
+        
+        
         else:
             #리스크에 맞게 랏 계산
-            actual_heat = min(heat, port_heat - port_risk)
+            actual_heat = min(heat,sector_heat - sector_risk, port_heat - port_risk)
             entrylot = Market.get_lot(risk_per_lot, actual_heat)
             risk = self.get_risk(inst, position, entryprice, stopprice, lot=entrylot)
             
@@ -444,7 +507,8 @@ class Trader:
             if not metric.hasnans:
                 #stopprice update
                 if self.stop:
-                    trade['stopprice'] = self.stop(trade, metric)
+                    stopprice = self.stop(trade, metric)
+                    trade['stopprice'] = stopprice
                 
                 trade['open_profit'], _ = Market.get_profit(inst, trade['position'], trade['entryprice'],
                                                  metric['close'], lot=trade['openlot'])
@@ -473,7 +537,10 @@ class Trader:
             return self.total_result()
         
         elif level == 1:
-            return self.trade_result()
+            return self.trade_result(level='sector')
+        
+        elif level == 2:
+            return self.trade_result(level='name')
     
     def report(self, symbol, start=None, end=None):
         """
@@ -481,7 +548,10 @@ class Trader:
         """
     
         feed = self.feed[symbol].loc[start:end].dropna()
-        tradelog = self.tradelog[self.tradelog.symbol == symbol]
+        tradelog = self.tradelog
+        tradelog = tradelog[tradelog.symbol == symbol]
+        
+        
         if start and end:
             trade = tradelog[ (start <= tradelog.entrydate) & (tradelog.exitdate <= end)]
         else:
@@ -517,20 +587,35 @@ class Trader:
         ax[1].grid(linestyle='--')
     
         plt.show()
-        return trade
+        return trade.reset_index(drop=True)
     
-    def trade_result(self):
+    def trade_result(self, level='name'):
         result = []
-        for symbol, table in self.tradelog.groupby('symbol'):
-            #rng = (trader.feed.index.max() - trader.feed.index.min()).days/365.25
+        for level, table in self.tradelog.groupby(level):
+            
+            long = table[table.position == 'Long']
+            longprofit = long.tick.mean()
+            longperiod = (long.exitdate - table.entrydate).mean().days
+
+            short = table[table.position == 'Short']
+            shortprofit = short.tick.mean()
+            shortperiod = (short.exitdate - short.entrydate).mean().days
+            
+            ave_num = len(table)/len(np.unique(table.symbol))
+            
             trade = OrderedDict({
-                'symbol': symbol,
-                'name': self.pinfo[symbol]['name'],
+                #'symbol': symbol,
+                'name': level,#self.pinfo[symbol]['name'],
                 '총손익(틱)': table.tick.sum(),
                 '평균손익(틱)': table.tick.mean(),
                 '표준편차(틱)': table.tick.std(),
                 '위험대비손익': (table.profit/table.risk).mean(),
-                '매매횟수': len(table)
+                '승률': len(table[table.profit >= 0])/len(table),
+                '매수평균(틱)': longprofit,
+                '매도평균(틱)': shortprofit,
+                'Period(L)': longperiod,
+                'Period(S)': shortperiod,
+                '# trades': ave_num
             })
             result.append(trade)
         df = pd.DataFrame(result)
@@ -541,72 +626,130 @@ class Trader:
                     '평균손익(틱)': "{:.2f}",
                     '표준편차(틱)': "{:.2f}",
                     '위험대비손익': "{:.2%}",
+                    '승률': "{:.2%}",
+                    '매수평균(틱)': "{:.2f}",
+                    '매도평균(틱)': "{:.2f}",
+                    'Period(L)': "{:.0f} days",
+                    'Period(S)': "{:.0f} days",
+                    '# trades': "{:.1f}"
                 })
         return df
     
+
     def total_result(self):
         trade = self.tradelog
-        equitylog = self.equitylog.loc[self.equitylog.index <= trade['exitdate'].max()]
+        equitylog = self.equitylog
         realequity = equitylog['real equity']
-        capital = equitylog.capital.iloc[-1]
-
+        capital = realequity.iloc[-1]
+        
         timedelta = (equitylog.index.max() - equitylog.index.min()).days/365.25
         drawdown = (realequity.cummax() - realequity)/realequity.cummax()
-
         mdd = drawdown.max()
         icagr = np.log(capital/self.principal) /timedelta
         bliss = icagr/mdd
-        cum_profit = (capital / self.principal) -1 
-        win_rate = trade.profit[trade.profit >= 0].count()\
-                                / trade.profit.count()
-        max_profit = trade.profit.max()
-        max_loss = trade.profit.min()
-        profit_factor = abs(trade.profit[trade.profit >=0].sum()/\
-                               trade.profit[trade.profit < 0].sum())
-        num_trade = trade.id.max() / timedelta
-        data = [[self.principal, capital, cum_profit, bliss, icagr, mdd, 
-                         profit_factor, win_rate, max_profit, max_loss, num_trade]]
-        columns = ['투자금','최종자산','총손익','Bliss','ICAGR','MDD','손익비','승률',
-                           '최대수익','최대손실','매매횟수(연)']
-        report = pd.DataFrame(data, index=['Total'], columns=columns)
+        
+        total = OrderedDict({
+            '투자금': self.principal,
+            '최종자산': capital,
+            '총손익': (capital / self.principal) - 1,
+            'Bliss': icagr/mdd,
+            'ICAGR': icagr,
+            'MDD': mdd,
+            '손익비': abs(trade.profit[trade.profit >=0].sum()/trade.profit[trade.profit < 0].sum()),
+            '승률': len(trade[trade.profit >= 0])/len(trade),
+            '위험대비손익': (trade.profit/trade.risk).mean(),
+            '평균손익': trade.profit.mean(),
+            '손익표준편차': trade.profit.std(),
+            '보유기간': (trade.exitdate - trade.entrydate).mean().days,
+            '# trades': len(trade) / timedelta
+        })
+        
+        trade = self.tradelog[self.tradelog.position == 'Long']
+        long = OrderedDict({
+            '투자금': '',
+            '최종자산': '',
+            '총손익': '',
+            'Bliss': '',
+            'ICAGR': '',
+            'MDD': '',
+            '손익비': abs(trade.profit[trade.profit >=0].sum()/trade.profit[trade.profit < 0].sum()),
+            '승률': len(trade[trade.profit >= 0])/len(trade),
+            '위험대비손익': (trade.profit/trade.risk).mean(),
+            '평균손익': trade.profit.mean(),
+            '손익표준편차': trade.profit.std(),
+            '보유기간': (trade.exitdate - trade.entrydate).mean().days,
+            '# trades': len(trade) / timedelta
+        })
+        
+        trade = self.tradelog[self.tradelog.position == 'Short']
+        short = OrderedDict({
+            '투자금': '',
+            '최종자산': '',
+            '총손익': '',
+            'Bliss': '',
+            'ICAGR': '',
+            'MDD': '',
+            '손익비': abs(trade.profit[trade.profit >=0].sum()/trade.profit[trade.profit < 0].sum()),
+            '승률': len(trade[trade.profit >= 0])/len(trade),
+            '위험대비손익': (trade.profit/trade.risk).mean(),
+            '평균손익': trade.profit.mean(),
+            '손익표준편차': trade.profit.std(),
+            '보유기간': (trade.exitdate - trade.entrydate).mean().days,
+            '# trades': len(trade) / timedelta
+        })
+        
+        #data = [[self.principal, capital, cum_profit, bliss, icagr, mdd, 
+        #                 profit_factor, win_rate, max_profit, max_loss, num_trade]]
+        #columns = ['투자금','최종자산','총손익','Bliss','ICAGR','MDD','손익비','승률',
+        #                   '최대수익','최대손실','매매횟수(연)']
+        report = pd.DataFrame([total,long,short], index=['Total','Long','Short'])
+        
         report = report.style.format({
-                    '투자금': "{:,.1f}",
-                    '최종자산': "{:,.1f}",
-                    '총손익': "{:.2%}",
-                    'Bliss': "{:.4f}",
-                    'ICAGR': "{:.2%}",
-                    'MDD': "{:.2%}",
+                    '투자금': lambda x: "{:,.0f}".format(x) if x else '',
+                    '최종자산': lambda x: "{:,.0f}".format(x) if x else '',
+                    '총손익': lambda x: "{:.2%}".format(x) if x else '',
+                    'Bliss': lambda x: "{:,.3f}".format(x) if x else '',
+                    'ICAGR': lambda x: "{:,.2%}".format(x) if x else '',
+                    'MDD': lambda x: "{:,.2%}".format(x) if x else '',
                     '손익비': "{:.2f}",
                     '승률': "{:.2%}",
-                    '최대수익': "{:,.2f}",
-                    '최대손실': "{:,.2f}",
-                    '매매횟수(연)': "{:.2f}"
+                    '위험대비손익': "{:,.2%}",
+                    '평균손익': "{:,.0f}",
+                    '손익표준편차': lambda x: "{:,.0f}".format(x) if x else '',
+                    '보유기간': "{:,.0f} days",
+                    '# trades': "{:.1f}"
                 })
+        
         
         return report 
     
     def equity_plot(self):
         trade = self.tradelog
-        equitylog = self.equitylog.loc[self.equitylog.index <= trade['exitdate'].max()]
+        equitylog = self.equitylog
         x = equitylog.index.values
         equity = equitylog.equity.values
+        capital = equitylog.capital.values
         realequity = equitylog['real equity'].values
         realequity_max = equitylog['real equity'].cummax().values
         
-        fig, ax = plt.subplots(1,1, figsize=(10, 8))
+        fig, ax = plt.subplots(1,1, figsize=(15, 8))
         #ax.fill_between(x, realequity, facecolor='green',alpha=0.4, interpolate=True)
-        ax.fill_between(x, self.principal, realequity, where=realequity>=self.principal, facecolor='green', alpha=0.4, interpolate=True)
+        ax.fill_between(x, self.principal, realequity, where=realequity>=self.principal, facecolor='green', alpha=0.4, interpolate=True, label='real equity')
         ax.fill_between(x, self.principal, realequity, where=realequity<self.principal, facecolor='red', alpha=0.6, interpolate=True)
         ax.fill_between(x, realequity, realequity_max, color='grey', alpha=0.2)
-        ax.plot(x, equity)
-        ax.set_ylim(realequity.min()*0.99, equity.max()*1.01)
+        ax.plot(x, equity, color='orange',alpha=0.7, linewidth=1, label='open equity')
+        ax.plot(x, capital, color='black',alpha=0.7, linewidth=1, label='capital')
+        
+        ax.set_xlim([x.min(), x.max()])
         
         #labels
-        ax.set_title('Cumulative Profit', fontsize=20)
-        ax.set_xlabel('Date', fontsize=15)
-        ax.set_ylabel('Profit', fontsize=15)
+        ax.legend(loc='upper left', fontsize='large')
+        ax.set_title('Cumulative Profit', fontsize=17)
+        #ax.set_xlabel('Date', fontsize=15)
+        ax.set_ylabel('equity ($)', fontsize=12)
         ax.yaxis.set_label_position("right")
-        
+       
+    
         #style
         ax.grid(linestyle='--')
         ax.yaxis.set_major_formatter(FuncFormatter(lambda x, p: format(int(x), ',')))
@@ -627,7 +770,7 @@ class Trader:
             # 매수진입 매매 없으면 진입
             if not self.trades.isopen(inst, 'GC', Market.long):
                 entryprice= Market.get_price(inst, metric['open'], metric['high'], skid=0.25)
-                stopprice = entryprice - metric['ATR']*3
+                stopprice = entryprice - metric['ATR']*5
                 self.buy(inst,'GC', Market.long, date, entryprice, stopprice)
             # 매도진입 매매 있으면 청산
             if self.trades.isopen(inst, 'GC', Market.short):
@@ -639,7 +782,7 @@ class Trader:
             #매도 진입 매매 없으면 매도 진입
             if not self.trades.isopen(inst, 'GC', Market.short):
                 entryprice= Market.get_price(inst, metric['open'], metric['low'], skid=0.25)
-                stopprice = entryprice + metric['ATR']*3
+                stopprice = entryprice + metric['ATR']*5
                 self.buy(inst,'GC', Market.short, date, entryprice, stopprice)
         
             # 매수진입 매매 있으면 청산
@@ -647,3 +790,7 @@ class Trader:
                 trade = self.trades.get(inst, 'GC', Market.long)
                 exitprice = Market.get_price(inst, metric['open'], metric['high'], skid=0.25)
                 self.sell(trade, date, exitprice)
+                
+    def default_stop(self, trade, metric):
+        return trade['stopprice']
+

@@ -6,63 +6,46 @@ import os
 from datetime import datetime, timedelta
 
 import numpy as np
-import scipy.sparse as sp
+import pandas as pd
 
-def get_tdop_array(density, info, now=None):
+def rolling_window(arr, window):
     """
-    pytables density table로부터 정해진 날짜의 tdop array를 반환한다.
-    args: 
-     density: pytables group,
-     tickunit: 틱단위,
-     digit: 소숫점자릿수,
-     name: 상품명
-     code: 상품코드
-     now: numpy datetime64 object 
+    numpy 어레이의 rolling window array를 반환함
+    stride trick을 사용하기 때문에 메모리 사용에 효율적임
+    ex)
+    arr: [1,2,3,4,5,6,7]
+    window: 3
+    return: 
+    [ [1,2,3],
+      [2,3,4],
+      [3,4,5],
+      [4,5,6],
+      [5,6,7] ]
     """
 
-    if now == None:
-        now = np.datetime64(datetime.now()+timedelta(hours=1)) #1시간 시차
-        
-    tickunit = info['tick_unit']
-    digit = info['decimal_places']
-    name = info['name']
-    code = info['group']
+    shape = arr.shape[:-1] + (arr.shape[-1] - window + 1, window)
+    strides = arr.strides + (arr.strides[-1],)
+    return np.lib.stride_tricks.as_strided(arr, shape=shape, strides=strides)
 
-    #print("processing: ", name)
-    # data preprocessing
-    dates = density.DateMapper.read(field='date').astype('M8[s]')
-    source = density.Minute.read()
-    price = source['price'].round(digit)
-    row_num = source['row']
-    col_num = np.rint((price-price.min())/tickunit)
-    value = source['value']
-    value[value == np.inf] = 0 #inf --> 0 
-    value[value > value.std()*15] = 0 # larger than std * 15 --> 0
-    value[value == np.NaN] = 0 # nan --> 0
-    
-    #sparse matrix creation
-    shape = (row_num.max()+1, col_num.max()+1)
-    matrix = sp.csr_matrix((value, (row_num, col_num)), shape=shape)
-    
-    #scale factor: sqrt(date - date)
-    delta = (now - dates)/np.timedelta64(1,'D') # 시차(일수)
-    delta[delta<0] = np.nan 
-    delta = delta +1 # 최소시차 = 1
-    seq = 1/np.sqrt(delta)
-    seq[np.isnan(seq)] = 0
-    scale = sp.diags(seq) #diagonal matrix
-    
-    #normalized TDOP
-    tdop = np.squeeze(np.asarray((scale*matrix).sum(axis=0)))
-    normed_tdop = tdop / tdop.sum()
-    x_ticks = np.arange(price.min(), price.max()+tickunit/2, tickunit).round(digit)
-    
-    return x_ticks, normed_tdop, now
+def set_ATR(metrics, span):
+    """
+    Average True Range를 구함
+    metrics: ohlc를 포함한 데이터 프레임
+    metrics 오브젝트에 ATR column를 추가함
+    """
+
+    df = pd.DataFrame()
+    df['hl'] = metrics['high'] - metrics['low']
+    df['hc'] = np.abs(metrics['high'] - metrics['close'].shift(1))
+    df['lc'] = np.abs(metrics['low'] - metrics['close'].shift(1))
+    df['TR'] = df.max(axis=1)
+    metrics['ATR'] = df['TR'].ewm(span).mean()
 
 
 def norm(data, ntype='abs_diff'):
     """
     Data Normalization
+    머신러닝 훈련 데이터 만들때 주로 사용됨
     """
     if ntype=="abs_diff":
         """
@@ -72,7 +55,7 @@ def norm(data, ntype='abs_diff'):
         base = np.abs(data.diff()).mean()
         return (data-data.mean())/base
 
-    if ntype=='min_max':
+    if ntype=='minmax':
         """
         (data - min)/(max-min)
         """
@@ -82,7 +65,14 @@ def norm(data, ntype='abs_diff'):
         return (data-data.mean())/data.std()
 
 
-
+def split(arr):
+    """
+    arr의 연속된 값들을 그룹으로 묶음
+    ex) 
+    input: [1,2,3,6,7,8,10]
+    output: [[1,2,3],[6,7,8],[10]]
+    """
+    return np.split(arr, np.where(np.diff(arr) != 1)[0]+1)
 
 """
 캔들 차트
