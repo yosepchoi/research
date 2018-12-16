@@ -26,10 +26,10 @@ def open_file(module, fname, mode='r', comp=False, force=False):
                 return tb.open_file(fpath, mode=mode)
 
 
-def product_info():
+def load_products():
     import json
 
-    fpath = os.path.join(DATADIR, 'product_info.json')
+    fpath = os.path.join(DATADIR, 'products.json')
     fobj = open(fpath).read()
     return json.loads(fobj)
 

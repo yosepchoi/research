@@ -348,6 +348,9 @@ class Trader:
         """
         pricediff = position * (entryprice - stopprice)
         if pricediff < 0:
+            print(inst)
+            print(entryprice)
+            print(stopprice)
             raise ValueError("trade risk cannot be negative")
         else:
             risk_per_lot = Market.price_to_value(inst, pricediff)
@@ -367,7 +370,7 @@ class Trader:
                 metric = metrics[symbol]
                 inst = self.pinfo[symbol]
                 if not metric.hasnans:
-                    self.strategy(inst, metric)
+                    self.strategy(inst, metric, metric.name)
                 
             # 강제청산 모니터링 및 매매기록
             self.force_stop(metrics)
@@ -466,14 +469,15 @@ class Trader:
                 stopprice = trade['stopprice']
                 high = metrics[symbol]['high']
                 low = metrics[symbol]['low']
-                
+                open = metrics[symbol]['open']
+
                 if (position == Market.long) and (stopprice > low):
-                    trade['low'] = low
-                    self.sell(trade, date, trade['stopprice'], force=True)
+                    stop = open if stopprice > open else stopprice
+                    self.sell(trade, date, stop, force=True)
                     
                 elif (position == Market.short) and (stopprice < high):
-                    trade['high'] = high
-                    self.sell(trade, date, trade['stopprice'], force=True)
+                    stop = open if stopprice < open else stopprice
+                    self.sell(trade, date, stop, force=True)
                     
                     
     def write_equitylog(self, metrics):
@@ -548,8 +552,8 @@ class Trader:
         """
     
         feed = self.feed[symbol].loc[start:end].dropna()
-        tradelog = self.tradelog
-        tradelog = tradelog[tradelog.symbol == symbol]
+        tradelog = self.tradelog[self.tradelog.symbol == symbol]
+        #tradelog = tradelog[tradelog.symbol == symbol]
         
         
         if start and end:
@@ -564,11 +568,12 @@ class Trader:
                                 gridspec_kw = {'height_ratios':[3,1]})
         
         #price chart
-        ax[0] = ohlc_chart(ax[0], feed, linewidth=0.8, color='black')
+        ax[0] = ohlc_chart(ax[0], feed, linewidth=0.8)
         for idx, row in trade.iterrows():
             y=feed.loc[row['entrydate']:row['exitdate']]
-            ax[0] = ohlc_chart(ax[0], y, color='red' if row['position']=='Long' else 'blue')
-       
+            colors=['red','red'] if row['position']=='Long' else ['blue','blue']
+            ax[0] = ohlc_chart(ax[0], y, colors=colors)
+        ax[0].plot(feed[['top','bottom']].shift(1), color='green', linewidth=0.8)
         #tick profit chart
         ax[1].bar(np.arange(1,num_trades+1), np.where(trade.position=='Long', trade.tick, 0), 0.3, color='red', alpha=0.6 )
         ax[1].bar(np.arange(1,num_trades+1), np.where(trade.position=='Short', trade.tick, 0), 0.3, color='blue', alpha=0.6 )
@@ -586,21 +591,14 @@ class Trader:
         ax[1].set_xticks(range(1,num_trades+1))
         ax[1].grid(linestyle='--')
     
-        plt.show()
-        return trade.reset_index(drop=True)
+        #plt.show()
+        return ax, feed#trade.reset_index(drop=True)
     
     def trade_result(self, level='name'):
         result = []
         for level, table in self.tradelog.groupby(level):
             
-            long = table[table.position == 'Long']
-            longprofit = long.tick.mean()
-            longperiod = (long.exitdate - table.entrydate).mean().days
-
-            short = table[table.position == 'Short']
-            shortprofit = short.tick.mean()
-            shortperiod = (short.exitdate - short.entrydate).mean().days
-            
+            period = (table.exitdate - table.entrydate).mean().days
             ave_num = len(table)/len(np.unique(table.symbol))
             
             trade = OrderedDict({
@@ -611,10 +609,7 @@ class Trader:
                 '표준편차(틱)': table.tick.std(),
                 '위험대비손익': (table.profit/table.risk).mean(),
                 '승률': len(table[table.profit >= 0])/len(table),
-                '매수평균(틱)': longprofit,
-                '매도평균(틱)': shortprofit,
-                'Period(L)': longperiod,
-                'Period(S)': shortperiod,
+                '보유기간': period,
                 '# trades': ave_num
             })
             result.append(trade)
@@ -639,11 +634,12 @@ class Trader:
     def total_result(self):
         trade = self.tradelog
         equitylog = self.equitylog
-        realequity = equitylog['real equity']
-        capital = realequity.iloc[-1]
+        #realequity = equitylog['real equity']
+        equity = equitylog['capital']
+        capital = equitylog['real equity'].iloc[-1]
         
         timedelta = (equitylog.index.max() - equitylog.index.min()).days/365.25
-        drawdown = (realequity.cummax() - realequity)/realequity.cummax()
+        drawdown = (equity.cummax() - equity)/equity.cummax()
         mdd = drawdown.max()
         icagr = np.log(capital/self.principal) /timedelta
         bliss = icagr/mdd
@@ -658,51 +654,14 @@ class Trader:
             '손익비': abs(trade.profit[trade.profit >=0].sum()/trade.profit[trade.profit < 0].sum()),
             '승률': len(trade[trade.profit >= 0])/len(trade),
             '위험대비손익': (trade.profit/trade.risk).mean(),
-            '평균손익': trade.profit.mean(),
+            '평균수익': trade.profit[trade.profit >=0 ].mean(),
+            '평균손실': trade.profit[trade.profit <0 ].mean(),
             '손익표준편차': trade.profit.std(),
             '보유기간': (trade.exitdate - trade.entrydate).mean().days,
             '# trades': len(trade) / timedelta
         })
         
-        trade = self.tradelog[self.tradelog.position == 'Long']
-        long = OrderedDict({
-            '투자금': '',
-            '최종자산': '',
-            '총손익': '',
-            'Bliss': '',
-            'ICAGR': '',
-            'MDD': '',
-            '손익비': abs(trade.profit[trade.profit >=0].sum()/trade.profit[trade.profit < 0].sum()),
-            '승률': len(trade[trade.profit >= 0])/len(trade),
-            '위험대비손익': (trade.profit/trade.risk).mean(),
-            '평균손익': trade.profit.mean(),
-            '손익표준편차': trade.profit.std(),
-            '보유기간': (trade.exitdate - trade.entrydate).mean().days,
-            '# trades': len(trade) / timedelta
-        })
-        
-        trade = self.tradelog[self.tradelog.position == 'Short']
-        short = OrderedDict({
-            '투자금': '',
-            '최종자산': '',
-            '총손익': '',
-            'Bliss': '',
-            'ICAGR': '',
-            'MDD': '',
-            '손익비': abs(trade.profit[trade.profit >=0].sum()/trade.profit[trade.profit < 0].sum()),
-            '승률': len(trade[trade.profit >= 0])/len(trade),
-            '위험대비손익': (trade.profit/trade.risk).mean(),
-            '평균손익': trade.profit.mean(),
-            '손익표준편차': trade.profit.std(),
-            '보유기간': (trade.exitdate - trade.entrydate).mean().days,
-            '# trades': len(trade) / timedelta
-        })
-        
-        #data = [[self.principal, capital, cum_profit, bliss, icagr, mdd, 
-        #                 profit_factor, win_rate, max_profit, max_loss, num_trade]]
-        #columns = ['투자금','최종자산','총손익','Bliss','ICAGR','MDD','손익비','승률',
-        #                   '최대수익','최대손실','매매횟수(연)']
-        report = pd.DataFrame([total,long,short], index=['Total','Long','Short'])
+        report = pd.DataFrame([total], index=['Total'])
         
         report = report.style.format({
                     '투자금': lambda x: "{:,.0f}".format(x) if x else '',
@@ -720,7 +679,6 @@ class Trader:
                     '# trades': "{:.1f}"
                 })
         
-        
         return report 
     
     def equity_plot(self):
@@ -734,13 +692,20 @@ class Trader:
         
         fig, ax = plt.subplots(1,1, figsize=(15, 8))
         #ax.fill_between(x, realequity, facecolor='green',alpha=0.4, interpolate=True)
-        ax.fill_between(x, self.principal, realequity, where=realequity>=self.principal, facecolor='green', alpha=0.4, interpolate=True, label='real equity')
+        ax.fill_between(x, self.principal, realequity, where=realequity>=self.principal, facecolor='green', alpha=0.4, interpolate=True, label='risk')
         ax.fill_between(x, self.principal, realequity, where=realequity<self.principal, facecolor='red', alpha=0.6, interpolate=True)
-        ax.fill_between(x, realequity, realequity_max, color='grey', alpha=0.2)
+        #ax.fill_between(x, realequity, realequity_max, color='grey', alpha=0.2)
+        ax.fill_between(x, capital, equitylog.capital.cummax().values, color='grey', alpha=0.2)
         ax.plot(x, equity, color='orange',alpha=0.7, linewidth=1, label='open equity')
         ax.plot(x, capital, color='black',alpha=0.7, linewidth=1, label='capital')
         
         ax.set_xlim([x.min(), x.max()])
+
+        #reference curve
+        refx = (x-x[0])/np.timedelta64(365,'D')
+        refy = self.principal*np.exp(0.1*refx)
+        ax.plot(x, refy, color='magenta', linestyle='--', label='reference')
+
         
         #labels
         ax.legend(loc='upper left', fontsize='large')
@@ -793,4 +758,3 @@ class Trader:
                 
     def default_stop(self, trade, metric):
         return trade['stopprice']
-

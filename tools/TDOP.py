@@ -66,20 +66,46 @@ def create_tdop(columns, values, dates, now=None, period=None, decayfactor=1):
     tdop = np.bincount(columns, weights=weight)
     return tdop
 
-def get_SR(tdop, thresh_hold):
+def get_SR(tdop, threshold):
     """
     tdop array로부터 지지저항선을 계산하여 반환
-    thresh_hold: normalized cum tdop의 SR 기준치 % ex)0.99 --> 99% 
+    threshold: normalized cum tdop의 SR 임계치 % ex)0.99 --> 99% 
     """
+    th = (1-threshold)/2
     norm = tdop/tdop.sum()
     cum = norm.cumsum()
-    args = np.where((cum > 1-thresh_hold) & (cum < thresh_hold))[0]
+    args = np.where((cum > th) & (cum < 1-th))[0]
 
     if args.size > 0:
         return args.min(), args.max()
     else:
         return None, None
 
+
+def get_resist(tdops, threshold):
+    """
+    tdops로부터 저항선을 계산하여 반환
+    threshold: normalized cum tdop의 SR 임계치 % ex)0.99 --> 99%
+    """
+    th = (1-threshold) / 2
+    values = tdops['tdop'].value
+    dates = tdops['dates'].value.astype('M8[s]')
+    price = tdops['prices'].value
+    
+    lower = []
+    upper = []
+    for date, value in zip(dates, values):
+        
+        tdop = value.cumsum()/value.sum() if value.sum() > 0 else value
+        effective = np.where( (th < tdop) & (tdop < 1-th))[0]
+        if effective.size> 0:
+            lower.append(price[effective.min()])
+            upper.append(price[effective.max()])
+        
+        else: #임계값이 없으면 마지막 값
+            lower.append(lower[-1] if lower else np.nan)
+            upper.append(upper[-1] if upper else np.nan)
+    return (lower,upper)
 
 def split(arr, idx):
     """
